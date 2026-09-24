@@ -122,7 +122,7 @@ Install the latest version of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/icryo/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/Thexiaoyuqaq/ida-pro-mcp/archive/refs/heads/main.zip
 ```
 
 Configure the MCP servers and install the IDA Plugin:
@@ -171,6 +171,23 @@ Another thing to keep in mind is that LLMs will not perform well on obfuscated c
 - Anti-decompilation tricks
 
 You should also use a tool like Lumina or FLIRT to try and resolve all the open source library code and the C++ STL, this will further improve the accuracy.
+
+## Multiple Databases (Gateway)
+
+The MCP server now acts as a **gateway** that discovers and routes to every running IDA endpoint, so a single client connection can work with many databases at once.
+
+How it works:
+- Each IDA GUI instance (plugin started via `Edit -> Plugins -> MCP`) binds a port (`13337`, `13338`, ...) and **self-registers** in a shared registry directory (`%TEMP%/ida-pro-mcp/instances`).
+- Each headless idalib worker does the same on an OS-assigned port.
+- The gateway (`ida-pro-mcp`) reads that registry, prunes dead/stale entries, and forwards each call over a pooled async HTTP client. Calls to *different* databases run in parallel; calls to the *same* database are serialized by IDA itself.
+
+Selecting a database:
+- `list_databases()`: list all connected databases with their `id`, module, port, and kind.
+- `use_database(id)`: set the session default database.
+- Every tool also accepts an optional `database` argument (id / module name / port) that overrides the default for that call.
+- With exactly one database open, no selection is needed — it is used automatically.
+
+Headless pool (idalib): `load_database(path)` spawns a dedicated worker process per binary, `close_database(id)` terminates it, and both appear in `list_databases()` alongside GUI instances. This allows analyzing multiple binaries concurrently in one session (IDA's kernel is a per-process singleton, so each headless database gets its own process).
 
 ## SSE Transport & Headless MCP
 
@@ -239,13 +256,13 @@ To install the MCP server yourself, follow these steps:
 ```json
 {
   "mcpServers": {
-    "github.com/icryo/ida-pro-mcp": {
+    "ida-pro-mcp": {
       "command": "uv",
       "args": [
         "--directory",
         "c:\\MCP\\ida-pro-mcp",
         "run",
-        "server.py",
+        "ida-pro-mcp",
         "--install-plugin"
       ],
       "timeout": 1800,
@@ -255,11 +272,11 @@ To install the MCP server yourself, follow these steps:
 }
 ```
 
-To check if the connection works you can perform the following tool call:
+`--directory` must point at your clone; `uv run ida-pro-mcp` launches the gateway (a single stable entry). Do **not** configure a port here — the gateway auto-discovers every running IDA instance. To check if the connection works you can perform the following tool call:
 
 ```
 <use_mcp_tool>
-<server_name>github.com/icryo/ida-pro-mcp</server_name>
+<server_name>ida-pro-mcp</server_name>
 <tool_name>check_connection</tool_name>
 <arguments></arguments>
 </use_mcp_tool>

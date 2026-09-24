@@ -11,6 +11,8 @@ import threading
 import socket
 import time
 import uuid
+import hashlib
+import tempfile
 from urllib.parse import urlparse, parse_qs
 from typing import (
     Any,
@@ -25,6 +27,44 @@ from typing import (
 )
 from typing_extensions import TypedDict, NotRequired
 
+REGISTRY_DIR = os.path.join(tempfile.gettempdir(), "ida-pro-mcp", "instances")
+
+
+def _registry_make_id(idb_path: str, port: int) -> str:
+    # Include the port so the same database opened in multiple IDA instances
+    # produces distinct ids. Keep in sync with discovery.make_id.
+    if idb_path:
+        norm = os.path.normcase(os.path.abspath(idb_path))
+        digest = hashlib.sha1(norm.encode("utf-8", "replace")).hexdigest()[:8]
+        return f"{digest}-{port}"
+    return f"port{port}"
+
+
+def _registry_write(instance_id: str, data: dict) -> None:
+    try:
+        os.makedirs(REGISTRY_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=REGISTRY_DIR, prefix=".tmp_", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, os.path.join(REGISTRY_DIR, f"{instance_id}.json"))
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass  # registry is best-effort; never break the server over it
+
+
+def _registry_unregister(instance_id: str) -> None:
+    try:
+        os.unlink(os.path.join(REGISTRY_DIR, f"{instance_id}.json"))
+    except OSError:
+        pass
+
+
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
         self.code = code
@@ -35,9 +75,18 @@ class RPCRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self.unsafe: set[str] = set()
+        # Cache resolved type hints per method to avoid reflection on every call.
+        self._hints: dict[str, Optional[dict]] = {}
 
     def register(self, func: Callable) -> Callable:
         self.methods[func.__name__] = func
+        try:
+            hints = get_type_hints(func)
+            hints.pop("return", None)
+            self._hints[func.__name__] = hints
+        except Exception:
+            # Fall back to lazy resolution at dispatch time.
+            self._hints[func.__name__] = None
         return func
 
     def mark_unsafe(self, func: Callable) -> Callable:
@@ -49,10 +98,11 @@ class RPCRegistry:
             raise JSONRPCError(-32601, f"Method '{method}' not found")
 
         func = self.methods[method]
-        hints = get_type_hints(func)
-
-        # Remove return annotation if present
-        hints.pop("return", None)
+        hints = self._hints.get(method)
+        if hints is None:
+            hints = get_type_hints(func)
+            # Remove return annotation if present
+            hints.pop("return", None)
 
         if isinstance(params, list):
             if len(params) != len(hints):
@@ -286,14 +336,66 @@ class MCPServer:
     BASE_PORT = 13337
     MAX_PORT_TRIES = 10
 
-    def __init__(self):
+    def __init__(self, base_port: int = BASE_PORT, kind: str = "gui"):
         self.server_socket = None
         self.server_thread = None
         self.running = False
         self.port = None  # Will be set when server starts
+        self.base_port = base_port  # 0 => OS-assigned ephemeral port
+        self.kind = kind  # "gui" | "idalib"
+        self.instance_id: Optional[str] = None
+        self.heartbeat_thread = None
         self.sessions: dict[str, SessionState] = {}
         self.connections: list[SSEConnection] = []
         self.mcp_handler = MCPProtocolHandler(rpc_registry)
+
+    def _register_instance(self):
+        """Announce this instance in the shared discovery registry."""
+        # IDA API calls must run on the main thread; the server runs in a worker
+        # thread, so marshal the metadata read via execute_sync.
+        meta = {"path": "", "module": ""}
+
+        def _read():
+            try:
+                meta["path"] = ida_nalt.get_input_file_path() or ""
+                meta["module"] = ida_nalt.get_root_filename() or ""
+            except Exception:
+                pass
+
+        try:
+            ida_kernwin.execute_sync(_read, ida_kernwin.MFF_READ)
+        except Exception:
+            pass
+
+        idb_path, module = meta["path"], meta["module"]
+        self.instance_id = _registry_make_id(idb_path, self.port)
+        now = time.time()
+        _registry_write(self.instance_id, {
+            "id": self.instance_id,
+            "host": self.HOST,
+            "port": self.port,
+            "idb_path": idb_path,
+            "module": module,
+            "pid": os.getpid(),
+            "kind": self.kind,
+            "started_at": now,
+            "heartbeat": now,
+        })
+
+    def _heartbeat_loop(self):
+        while self.running and self.instance_id:
+            time.sleep(10)
+            if not self.running:
+                break
+            path = os.path.join(REGISTRY_DIR, f"{self.instance_id}.json")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                data["heartbeat"] = time.time()
+                _registry_write(self.instance_id, data)
+            except (OSError, ValueError):
+                # entry vanished (e.g. registry cleared) -> re-announce
+                self._register_instance()
 
     def start(self):
         """Start the MCP server"""
@@ -311,6 +413,11 @@ class MCPServer:
             return
 
         self.running = False
+
+        # Remove our discovery registry entry
+        if self.instance_id:
+            _registry_unregister(self.instance_id)
+            self.instance_id = None
 
         # Close all SSE connections
         for conn in self.connections[:]:
@@ -517,6 +624,10 @@ class MCPServer:
                     result = self.mcp_handler.handle_tools_list(params)
                 elif method == "tools/call":
                     result = self.mcp_handler.handle_tools_call(params)
+                elif method in self.mcp_handler.registry.methods:
+                    # Raw JSON-RPC method call (used by the gateway to forward tools
+                    # directly). params is a positional list or a named dict.
+                    result = self.mcp_handler.registry.dispatch(method, params)
                 else:
                     raise JSONRPCError(-32601, f"Method not found: {method}")
 
@@ -689,6 +800,10 @@ class MCPServer:
                     result = self.mcp_handler.handle_tools_list(params)
                 elif method == "tools/call":
                     result = self.mcp_handler.handle_tools_call(params)
+                elif method in self.mcp_handler.registry.methods:
+                    # Raw JSON-RPC method call (used by the gateway to forward tools
+                    # directly). params is a positional list or a named dict.
+                    result = self.mcp_handler.registry.dispatch(method, params)
                 else:
                     raise JSONRPCError(-32601, f"Method not found: {method}")
 
@@ -939,29 +1054,51 @@ class MCPServer:
     def _run_server(self):
         """Run the SSE server main loop"""
         try:
-            # Try to bind to a port starting from BASE_PORT
+            # Try to bind to a port starting from base_port
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            for i in range(self.MAX_PORT_TRIES):
-                port = self.BASE_PORT + i
+            if sys.platform == "win32":
+                # On Windows SO_REUSEADDR lets MULTIPLE sockets bind the SAME port,
+                # which would let a second IDA instance also grab 13337 instead of
+                # incrementing to 13338 -- collapsing distinct databases onto one
+                # port. Use SO_EXCLUSIVEADDRUSE so an in-use port fails to bind and
+                # the auto-increment below picks the next free port.
                 try:
-                    self.server_socket.bind((self.HOST, port))
-                    self.port = port
-                    break
-                except OSError as e:
-                    if e.errno in (98, 10048):  # Address already in use
-                        if i == self.MAX_PORT_TRIES - 1:
-                            raise OSError(f"Could not find available port in range {self.BASE_PORT}-{self.BASE_PORT + self.MAX_PORT_TRIES - 1}")
-                        continue
-                    raise
+                    self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                except (AttributeError, OSError):
+                    pass
+            else:
+                self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            if self.base_port == 0:
+                # Ephemeral: let the OS assign a free port (headless workers)
+                self.server_socket.bind((self.HOST, 0))
+                self.port = self.server_socket.getsockname()[1]
+            else:
+                for i in range(self.MAX_PORT_TRIES):
+                    port = self.base_port + i
+                    try:
+                        self.server_socket.bind((self.HOST, port))
+                        self.port = port
+                        break
+                    except OSError as e:
+                        if e.errno in (98, 10048, 10013):  # in use / access denied (exclusive)
+                            if i == self.MAX_PORT_TRIES - 1:
+                                raise OSError(f"Could not find available port in range {self.base_port}-{self.base_port + self.MAX_PORT_TRIES - 1}")
+                            continue
+                        raise
 
             self.server_socket.listen(5)
             self.server_socket.settimeout(1.0)  # Timeout for accept
 
+            # Announce ourselves for gateway discovery + start heartbeat
+            self._register_instance()
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
+
             print("[MCP] Server started:")
             print(f"  Streamable HTTP: http://{self.HOST}:{self.port}/mcp")
             print(f"  SSE: http://{self.HOST}:{self.port}/sse")
+            print(f"  Discovery id: {self.instance_id} ({self.kind})")
 
             while self.running:
                 try:

@@ -1,9 +1,11 @@
 import sys
+import time
 import signal
 import inspect
 import logging
 import argparse
 import importlib
+import threading
 from pathlib import Path
 from typing import Annotated, Optional, Any
 import typing_inspection.introspection as intro
@@ -273,6 +275,75 @@ def fixup_tool_argument_descriptions(mcp: FastMCP):
             logger.debug("adding parameter documentation %s(%s='%s')", tool.name, name, description)
             tool.parameters["properties"][name]["description"] = description
 
+def _run_worker(input_path: Path, run_auto_analysis: bool, host: str, verbose: bool, unsafe: bool):
+    """Headless single-database worker used by the gateway's process pool.
+
+    Loads exactly one database and serves the same raw JSON-RPC endpoint as the
+    GUI plugin (MCPServer) on an OS-assigned port, self-registering in the shared
+    discovery registry so the gateway can route to it.
+    """
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    if hasattr(idapro, "enable_console_messages"):
+        idapro.enable_console_messages(verbose)
+
+    logger.info("worker opening database: %s", input_path)
+    if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis):
+        raise RuntimeError(f"failed to open database: {input_path}")
+
+    if run_auto_analysis:
+        ida_auto.auto_wait()
+
+    if not ida_hexrays.init_hexrays_plugin():
+        logger.warning("Failed to initialize Hex-Rays decompiler - decompilation unavailable")
+
+    plugin = importlib.import_module("ida_pro_mcp.mcp-plugin")
+
+    # idalib-only capability: expose save_database over the same JSON-RPC channel.
+    import idc
+
+    def save_database(path: str = "") -> str:
+        if path:
+            ok = idc.save_database(path, idc.DBFL_COMP)
+            return f"Saved database to {path}" if ok else "Failed to save database"
+        ok = idc.save_database("", idc.DBFL_COMP)
+        return "Saved database" if ok else "Failed to save database"
+
+    plugin.rpc_registry.register(plugin.idawrite(save_database))
+
+    server = plugin.MCPServer(base_port=0, kind="idalib")
+    server.start()
+
+    # Wait for the socket thread to bind + self-register.
+    for _ in range(100):
+        if server.port:
+            break
+        time.sleep(0.1)
+    if not server.port:
+        raise RuntimeError("worker MCP server failed to bind a port")
+
+    stop_event = threading.Event()
+
+    def cleanup(signum, frame):
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    logger.info("idalib worker ready: %s (id=%s, port=%s)", input_path.name, server.instance_id, server.port)
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.5)
+    finally:
+        server.stop()
+        try:
+            idapro.close_database()
+        except Exception:
+            pass
+        logger.info("idalib worker stopped: %s", input_path.name)
+
+
 def main():
     global _db_state
 
@@ -281,8 +352,19 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to listen on, default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=8745, help="Port to listen on, default: 8745")
     parser.add_argument("--unsafe", action="store_true", help="Enable unsafe functions (DANGEROUS)")
+    parser.add_argument("--worker", type=Path, default=None, help="Run as a single-database gateway pool worker for the given file (internal)")
+    parser.add_argument("--no-analysis", action="store_true", help="Skip auto-analysis when loading (worker mode)")
     parser.add_argument("input_path", type=Path, nargs="?", default=None, help="Optional path to the input file to analyze. If not provided, use load_database tool to load files.")
     args = parser.parse_args()
+
+    # Worker mode: serve a single database over the shared JSON-RPC endpoint and
+    # self-register for gateway discovery. Bypasses the FastMCP flow entirely.
+    if args.worker is not None:
+        logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
+        _run_worker(args.worker, run_auto_analysis=not args.no_analysis,
+                    host=args.host, verbose=args.verbose, unsafe=args.unsafe)
+        return
+
 
     if args.verbose:
         log_level = logging.DEBUG
