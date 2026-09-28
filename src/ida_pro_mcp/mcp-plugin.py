@@ -1716,6 +1716,41 @@ class String(TypedDict):
     length: int
     string: str
 
+
+# Enumerating every string (idautils.Strings() + str() per item) is expensive on
+# large binaries and dominates list_strings*/search latency. Cache the full list
+# per-database with a short TTL so a burst of filtered/paginated queries only pays
+# the enumeration cost once. TTL bounds staleness if strings change during analysis.
+_STRINGS_CACHE_TTL = 60.0
+_strings_cache: dict = {"key": None, "time": 0.0, "data": None}
+
+
+def _get_all_strings() -> list[String]:
+    """Return all strings for the current database, using a short-lived cache."""
+    now = time.time()
+    key = ida_nalt.get_input_file_path() or ""
+    cache = _strings_cache
+    if (cache["data"] is not None and cache["key"] == key
+            and (now - cache["time"]) < _STRINGS_CACHE_TTL):
+        return cache["data"]
+
+    strings: list[String] = []
+    for item in idautils.Strings():
+        if item is None:
+            continue
+        try:
+            string = str(item)
+            if string:
+                strings.append(String(address=hex(item.ea), length=item.length, string=string))
+        except Exception:
+            continue
+
+    cache["data"] = strings
+    cache["key"] = key
+    cache["time"] = now
+    return strings
+
+
 @jsonrpc
 @idaread
 def list_strings_filter(
@@ -1724,19 +1759,7 @@ def list_strings_filter(
     filter: Annotated[str, "Filter to apply to the list (required parameter, empty string for no filter). Case-insensitive contains or /regex/ syntax"],
 ) -> Page[String]:
     """List matching strings in the database (paginated, filtered)"""
-    strings: list[String] = []
-    for item in idautils.Strings():
-        if item is None:
-            continue
-        try:
-            string = str(item)
-            if string:
-                strings += [
-                    String(address=hex(item.ea), length=item.length, string=string),
-                ]
-        except:
-            continue
-    strings = pattern_filter(strings, filter, "string")
+    strings = pattern_filter(_get_all_strings(), filter, "string")
     return paginate(strings, offset, count)
 
 @jsonrpc
@@ -2929,6 +2952,30 @@ class SearchMatch(TypedDict):
     address: str
     context: str  # hex bytes around the match
 
+
+def _find_binary_pattern(start_ea: int, end_ea: int, ida_pattern: str) -> int:
+    """Find a binary pattern, compatible across IDA 8.x and 9.x.
+
+    IDA 9.0 removed ida_bytes.find_binary; use parse_binpat_str + bin_search there.
+    `ida_pattern` uses IDA's textual form (hex bytes, "?" for wildcard nibbles).
+    Returns the match address, or idaapi.BADADDR when not found.
+    """
+    # IDA 8.x
+    if hasattr(ida_bytes, "find_binary"):
+        return ida_bytes.find_binary(start_ea, end_ea, ida_pattern, 16, ida_bytes.BIN_SEARCH_FORWARD)
+
+    # IDA 9.x
+    patterns = ida_bytes.compiled_binpat_vec_t()
+    ida_bytes.parse_binpat_str(patterns, start_ea, ida_pattern, 16)
+    if len(patterns) == 0:
+        raise IDAError(f"Failed to parse search pattern: {ida_pattern}")
+    res = ida_bytes.bin_search(start_ea, end_ea, patterns, ida_bytes.BIN_SEARCH_FORWARD)
+    # Some builds return (ea, pattern_index); others return a bare ea_t.
+    if isinstance(res, tuple):
+        res = res[0]
+    return idaapi.BADADDR if res is None else res
+
+
 @jsonrpc
 @idaread
 def search_bytes(
@@ -2975,8 +3022,8 @@ def search_bytes(
     current_ea = start_ea
 
     while len(results) < max_results:
-        # Search for pattern
-        found_ea = ida_bytes.find_binary(current_ea, end_ea, ida_pattern, 16, ida_bytes.BIN_SEARCH_FORWARD)
+        # Search for pattern (version-compatible)
+        found_ea = _find_binary_pattern(current_ea, end_ea, ida_pattern)
 
         if found_ea == idaapi.BADADDR:
             break
