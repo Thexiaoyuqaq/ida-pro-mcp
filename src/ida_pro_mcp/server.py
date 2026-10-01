@@ -562,11 +562,15 @@ def _resolve_gateway_python(src_dir: str) -> str:
     return sys.executable  # last resort; nothing validated
 
 
-def _gateway_server_entry(is_toml: bool) -> dict:
+def _gateway_server_entry(is_toml: bool, client: str = "") -> dict:
     """Config entry pointing the MCP client at this gateway (a single stable stdio entry).
 
     Pins PYTHONPATH to the real on-disk source directory and uses a validated
     interpreter so the entry works whether or not the package was pip-installed.
+
+    `client` is the human-readable client name (keys of the `configs` dict in
+    install_mcp_servers). It matters because the per-server `timeout` field is
+    interpreted in different units by different clients.
     """
     src_dir = os.path.dirname(SCRIPT_DIR)  # .../src (parent of the ida_pro_mcp package)
     entry: dict = {
@@ -583,10 +587,20 @@ def _gateway_server_entry(is_toml: bool) -> dict:
     server_env["PYTHONPATH"] = os.pathsep.join(parts)
     entry["env"] = server_env
     if not is_toml:
-        entry["timeout"] = 1800
-        entry["disabled"] = False
-        entry["autoApprove"] = SAFE_FUNCTIONS
-        entry["alwaysAllow"] = SAFE_FUNCTIONS
+        if client == "Claude Code":
+            # Claude Code reads mcpServers."timeout" in MILLISECONDS and treats it as
+            # the per-tool-call wall-clock limit (overriding MCP_TOOL_TIMEOUT). Writing
+            # 1800 here would mean 1.8s and kill any slow call (xrefs, decompile, ...).
+            # It also uses its own permission system (permissions.allow in settings.json),
+            # so the Cline-style autoApprove/alwaysAllow/disabled keys are ignored.
+            entry["timeout"] = 600000  # 10 minutes, in milliseconds
+        else:
+            # Cline / Roo Code / Kilo Code convention: "timeout" is in SECONDS, plus
+            # their own approval keys. Other JSON clients ignore these harmlessly.
+            entry["timeout"] = 1800
+            entry["disabled"] = False
+            entry["autoApprove"] = SAFE_FUNCTIONS
+            entry["alwaysAllow"] = SAFE_FUNCTIONS
     return entry
 
 
@@ -696,7 +710,7 @@ def install_mcp_servers(*, uninstall=False, quiet=False, env={}):
                 continue
             del mcp_servers[mcp.name]
         else:
-            mcp_servers[mcp.name] = _gateway_server_entry(is_toml=is_toml)
+            mcp_servers[mcp.name] = _gateway_server_entry(is_toml=is_toml, client=name)
 
         # Atomic write: temp file + rename
         suffix = ".toml" if is_toml else ".json"
