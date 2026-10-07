@@ -1,3 +1,13 @@
+"""
+Gateway routing/discovery tests that run WITHOUT IDA.
+
+Spins up fake JSON-RPC HTTP servers that impersonate IDA instances, registers
+them in a temporary discovery registry, and exercises the gateway's discovery,
+target resolution, forwarding, and cross-instance concurrency.
+
+Run: python -m tests.test_gateway   (from the repo root, using the project venv)
+"""
+
 import os
 import sys
 import time

@@ -24,7 +24,7 @@ import ida_hexrays
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("github.com/icryo/ida-pro-mcp#idalib")
+mcp = FastMCP("ida-pro-mcp")
 
 # Global state for database management
 _db_state = {

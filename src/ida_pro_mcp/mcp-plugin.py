@@ -7,17 +7,22 @@ if sys.version_info < (3, 11):
 import json
 import re
 import struct
+import inspect
 import threading
 import socket
 import time
 import uuid
 import hashlib
 import tempfile
+from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from typing import (
     Any,
     Callable,
     get_type_hints,
+    get_origin,
+    get_args,
+    Union,
     Optional,
     Annotated,
     TypeVar,
@@ -26,6 +31,12 @@ from typing import (
     Literal,
 )
 from typing_extensions import TypedDict, NotRequired
+
+# ============================================================================
+# Instance registry (inlined; keep the JSON schema + REGISTRY_DIR in sync with
+# discovery.py, which the gateway uses to read these entries). This file is
+# deployed standalone into IDA's plugins folder and cannot import discovery.py.
+# ============================================================================
 
 REGISTRY_DIR = os.path.join(tempfile.gettempdir(), "ida-pro-mcp", "instances")
 
@@ -75,8 +86,9 @@ class RPCRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self.unsafe: set[str] = set()
-        # Cache resolved type hints per method to avoid reflection on every call.
+        # Cache resolved type hints + defaults per method to avoid reflection on every call.
         self._hints: dict[str, Optional[dict]] = {}
+        self._defaults: dict[str, dict[str, Any]] = {}
 
     def register(self, func: Callable) -> Callable:
         self.methods[func.__name__] = func
@@ -85,8 +97,16 @@ class RPCRegistry:
             hints.pop("return", None)
             self._hints[func.__name__] = hints
         except Exception:
-            # Fall back to lazy resolution at dispatch time.
             self._hints[func.__name__] = None
+        try:
+            sig = inspect.signature(func)
+            self._defaults[func.__name__] = {
+                name: param.default
+                for name, param in sig.parameters.items()
+                if param.default is not inspect.Parameter.empty
+            }
+        except Exception:
+            self._defaults[func.__name__] = {}
         return func
 
     def mark_unsafe(self, func: Callable) -> Callable:
@@ -101,16 +121,26 @@ class RPCRegistry:
         hints = self._hints.get(method)
         if hints is None:
             hints = get_type_hints(func)
-            # Remove return annotation if present
             hints.pop("return", None)
+        defaults = self._defaults.get(method, {})
 
         if isinstance(params, list):
-            if len(params) != len(hints):
-                raise JSONRPCError(-32602, f"Invalid params: expected {len(hints)} arguments, got {len(params)}")
+            # Backfill omitted trailing positional args with their defaults.
+            supplied = list(params)
+            if len(supplied) > len(hints):
+                raise JSONRPCError(-32602, f"Invalid params: too many arguments (expected at most {len(hints)}, got {len(supplied)})")
+            # Pad with defaults for omitted params (trailing defaults only; missing
+            # a non-defaulted positional is an error).
+            param_names = list(hints.keys())
+            for i in range(len(supplied), len(param_names)):
+                name = param_names[i]
+                if name in defaults:
+                    supplied.append(defaults[name])
+                else:
+                    raise JSONRPCError(-32602, f"Invalid params: missing required argument '{name}'")
 
-            # Validate and convert parameters
             converted_params = []
-            for value, (param_name, expected_type) in zip(params, hints.items()):
+            for value, (param_name, expected_type) in zip(supplied, hints.items()):
                 try:
                     if not isinstance(value, expected_type):
                         value = expected_type(value)
@@ -120,13 +150,22 @@ class RPCRegistry:
 
             return func(*converted_params)
         elif isinstance(params, dict):
-            if set(params.keys()) != set(hints.keys()):
-                raise JSONRPCError(-32602, f"Invalid params: expected {list(hints.keys())}")
+            provided_keys = set(params.keys())
+            expected_keys = set(hints.keys())
+            unknown = provided_keys - expected_keys
+            if unknown:
+                raise JSONRPCError(-32602, f"Invalid params: unknown argument(s) {sorted(unknown)}")
+
+            # Backfill omitted keys with their defaults
+            effective = dict(params)
+            for name, default in defaults.items():
+                if name not in effective:
+                    effective[name] = default
 
             # Validate and convert parameters
             converted_params = {}
             for param_name, expected_type in hints.items():
-                value = params.get(param_name)
+                value = effective.get(param_name)
                 try:
                     if not isinstance(value, expected_type):
                         value = expected_type(value)
@@ -219,6 +258,35 @@ class SSEConnection:
         except:
             pass
 
+def _json_schema_type(py_type: Any) -> dict:
+    """Map a Python type annotation to a JSON schema type fragment."""
+    # bool before int: not strictly needed with `is` checks, but keep order obvious
+    if py_type is bool:
+        return {"type": "boolean"}
+    if py_type is int:
+        return {"type": "integer"}
+    if py_type is float:
+        return {"type": "number"}
+    if py_type is str:
+        return {"type": "string"}
+    origin = get_origin(py_type)
+    if origin is Literal:
+        args = get_args(py_type)
+        if args and all(a is str for a in args):
+            return {"type": "string", "enum": list(args)}
+        if args and all(a is int for a in args):
+            return {"type": "integer", "enum": list(args)}
+        if args:
+            return {"enum": list(args)}
+    if origin in (list, set, frozenset, tuple) or py_type is list:
+        return {"type": "array"}
+    if origin is dict or py_type is dict:
+        return {"type": "object"}
+    # Unknown/complex types keep the historical fallback so clients
+    # that strict-validate still accept the call.
+    return {"type": "string"}
+
+
 class MCPProtocolHandler:
     """Handles MCP protocol messages and generates tool schemas"""
 
@@ -226,7 +294,7 @@ class MCPProtocolHandler:
         self.registry = registry
         self.server_info = {
             "name": "ida-pro-mcp",
-            "version": "1.0.0"
+            "version": "1.6.0"
         }
         self.capabilities = {
             "tools": {
@@ -236,41 +304,40 @@ class MCPProtocolHandler:
 
     def generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
-        hints = get_type_hints(func)
+        # include_extras=True keeps Annotated[..., "description"] intact so the
+        # per-parameter descriptions actually survive into the schema.
+        hints = get_type_hints(func, include_extras=True)
         hints.pop("return", None)
+        sig = inspect.signature(func)
 
         # Build parameter schema
         properties = {}
         required = []
 
         for param_name, param_type in hints.items():
-            # Handle Annotated types to extract descriptions
+            # Unwrap Annotated[real_type, "description"] to get both parts
             description = ""
             actual_type = param_type
+            if get_origin(param_type) is Annotated:
+                metadata = param_type.__metadata__
+                if metadata and isinstance(metadata[0], str):
+                    description = metadata[0]
+                actual_type = param_type.__args__[0]
 
-            if hasattr(param_type, '__origin__'):
-                if param_type.__origin__ is Annotated:
-                    args = param_type.__metadata__
-                    if args:
-                        description = args[0]
-                    actual_type = param_type.__args__[0]
+            # Unwrap Optional[X]/Union[X, None] when unambiguous
+            if get_origin(actual_type) in (Union, UnionType):
+                non_none = [a for a in get_args(actual_type) if a is not type(None)]
+                if len(non_none) == 1:
+                    actual_type = non_none[0]
 
-            # Map Python types to JSON schema types
-            json_type = "string"  # default
-            if actual_type == int:
-                json_type = "integer"
-            elif actual_type == float:
-                json_type = "number"
-            elif actual_type == bool:
-                json_type = "boolean"
-            elif actual_type == str:
-                json_type = "string"
+            schema = dict(_json_schema_type(actual_type))
+            schema["description"] = description
+            properties[param_name] = schema
 
-            properties[param_name] = {
-                "type": json_type,
-                "description": description
-            }
-            required.append(param_name)
+            # Only require parameters the caller must actually supply; a
+            # parameter with a default keeps its default when omitted.
+            if sig.parameters[param_name].default is inspect.Parameter.empty:
+                required.append(param_name)
 
         # Get docstring as description
         description = func.__doc__ or f"Call {func_name}"
@@ -295,10 +362,17 @@ class MCPProtocolHandler:
             tools.append(tool_schema)
         return tools
 
+    # Keep in sync with mcp.shared.version.SUPPORTED_PROTOCOL_VERSIONS
+    SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+    DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+
     def handle_initialize(self, params: dict) -> dict:
-        """Handle MCP initialize request"""
+        """Handle MCP initialize request (echo the client's version when supported)"""
+        requested = params.get("protocolVersion")
+        if requested not in self.SUPPORTED_PROTOCOL_VERSIONS:
+            requested = self.DEFAULT_PROTOCOL_VERSION
         return {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": requested,
             "capabilities": self.capabilities,
             "serverInfo": self.server_info
         }
