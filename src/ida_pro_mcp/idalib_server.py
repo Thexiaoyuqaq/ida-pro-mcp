@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Annotated, Optional, Any
 import typing_inspection.introspection as intro
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # ida/idapro must go first to initialize idalib
 # IDA 9.0+ uses 'ida' module, IDA 8.x uses 'idapro'
@@ -24,7 +24,7 @@ import ida_hexrays
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("ida-pro-mcp")
+mcp = MCPServer("ida-pro-mcp", version="1.7.0")
 
 # Global state for database management
 _db_state = {
@@ -191,7 +191,7 @@ def get_database_status() -> dict[str, Any]:
         "tools_available": _db_state["tools_registered"]
     }
 
-def fixup_tool_argument_descriptions(mcp: FastMCP):
+def fixup_tool_argument_descriptions(mcp: MCPServer):
     # In our tool definitions within `mcp-plugin.py`, we use `typing.Annotated` on function parameters
     # to attach documentation. For example:
     #
@@ -202,7 +202,7 @@ def fixup_tool_argument_descriptions(mcp: FastMCP):
     #         ...
     #
     # However, the interpretation of Annotated is left up to static analyzers and other tools.
-    # FastMCP doesn't have any special handling for these comments, so we splice them into the
+    # MCPServer doesn't have any special handling for these comments, so we splice them into the
     # tool metadata ourselves here.
     #
     # Example, before:
@@ -238,7 +238,7 @@ def fixup_tool_argument_descriptions(mcp: FastMCP):
     #   - https://docs.python.org/3/library/typing.html#typing.Annotated
     #   - https://fastapi.tiangolo.com/python-types/#type-hints-with-metadata-annotations
 
-    # unfortunately, FastMCP.list_tools() is async, so we break with best practices and reach into `._tool_manager`
+    # unfortunately, MCPServer.list_tools() is async, so we break with best practices and reach into `._tool_manager`
     # rather than spinning up an asyncio runtime just to fetch the (non-async) list of tools.
     for tool in mcp._tool_manager.list_tools():
         sig = inspect.signature(tool.fn)
@@ -358,7 +358,7 @@ def main():
     args = parser.parse_args()
 
     # Worker mode: serve a single database over the shared JSON-RPC endpoint and
-    # self-register for gateway discovery. Bypasses the FastMCP flow entirely.
+    # self-register for gateway discovery. Bypasses the MCPServer flow entirely.
     if args.worker is not None:
         logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO)
         _run_worker(args.worker, run_auto_analysis=not args.no_analysis,
@@ -376,8 +376,6 @@ def main():
             idapro.enable_console_messages(False)
 
     mcp.settings.log_level = logging.getLevelName(log_level)
-    mcp.settings.host = args.host
-    mcp.settings.port = args.port
     logging.basicConfig(level=log_level)
 
     # reset logging levels that might be initialized in idapythonrc.py
@@ -413,7 +411,7 @@ def main():
 
     # Setup signal handlers to ensure IDA database is properly closed on shutdown.
     #
-    # PROBLEM: When uvicorn (used by FastMCP's SSE transport) receives SIGINT/SIGTERM:
+    # PROBLEM: When uvicorn (used by MCPServer's SSE transport) receives SIGINT/SIGTERM:
     #   1. It captures the signal and performs graceful shutdown
     #   2. After shutdown, it re-raises the signal with the default handler
     #   3. The default handler immediately terminates the process at the OS level
@@ -433,8 +431,8 @@ def main():
     signal.signal(signal.SIGTERM, cleanup_and_exit)
 
     # NOTE: npx @modelcontextprotocol/inspector for debugging
-    logger.info("MCP Server available at: http://%s:%d/sse", mcp.settings.host, mcp.settings.port)
-    mcp.run(transport="sse")
+    logger.info("MCP Server available at: http://%s:%d/sse", args.host, args.port)
+    mcp.run(transport="sse", host=args.host, port=args.port)
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,17 @@
+"""
+Shared instance-discovery registry for ida-pro-mcp.
+
+Every running IDA endpoint (a GUI plugin instance, or a headless idalib worker)
+writes a small JSON file describing itself into a shared registry directory. The
+gateway reads these files to discover which databases are currently available and
+routes tool calls to the right one.
+
+NOTE: mcp-plugin.py is deployed as a *single standalone file* into IDA's plugins
+folder and therefore cannot import this module. It inlines a compatible writer
+under the "instance registry" section -- keep the on-disk JSON schema and
+REGISTRY_DIR path in sync between the two.
+"""
+
 import os
 import sys
 import json
@@ -150,6 +164,13 @@ def discover(prune: bool = True) -> list[InstanceInfo]:
                 data = json.load(f)
             info = InstanceInfo.from_dict(data)
         except (OSError, ValueError, KeyError):
+            # Corrupt/truncated entry (e.g. an empty file left by a crash):
+            # skip it and, when pruning, remove it so it cannot accumulate.
+            if prune:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
             continue  # tolerate partial/corrupt/locked files
 
         stale = bool(info.heartbeat) and (now - info.heartbeat) > HEARTBEAT_TIMEOUT

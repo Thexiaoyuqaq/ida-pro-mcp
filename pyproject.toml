@@ -1,6 +1,6 @@
 [project]
 name = "ida-pro-mcp"
-version = "1.6.0"
+version = "1.7.0"
 description = "Vibe reversing with IDA Pro"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,9 +18,10 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
 ]
 dependencies = [
-    "mcp>=1.16.0",
+    "mcp>=2.3.0,<3",
     "tomli-w>=1.0.0",
     "httpx>=0.27.0",
+    "typing-inspection>=0.4.1",
 ]
 
 [project.urls]
@@ -33,7 +34,7 @@ build-backend = "setuptools.build_meta"
 
 [dependency-groups]
 dev = [
-    "mcp[cli]>=1.6.0",
+    "mcp[cli]>=2.3.0,<3",
     "ty>=0.0.1a21",
 ]
 

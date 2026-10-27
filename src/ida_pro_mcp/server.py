@@ -19,12 +19,12 @@ from glob import glob
 
 import httpx
 from pydantic import Field
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from ida_pro_mcp import discovery
 
-# The log_level is necessary for Cline to work: https://github.com/jlowin/fastmcp/issues/81
-mcp = FastMCP("ida-pro-mcp", log_level="ERROR")
+# Keep log_level=ERROR so stdout stays clean for stdio clients (Cline et al.).
+mcp = MCPServer("ida-pro-mcp", version="1.7.0", log_level="ERROR")
 
 # Gateway-native tools (not generated from mcp-plugin.py). Kept safe/auto-approved.
 GATEWAY_TOOLS = [
@@ -535,7 +535,9 @@ def _interpreter_works(python_exe: str, src_dir: str) -> bool:
         existing = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = os.pathsep.join([src_dir] + ([existing] if existing else []))
         result = subprocess.run(
-            [python_exe, "-c", "import httpx, mcp, pydantic, ida_pro_mcp"],
+            [python_exe, "-c",
+             "import httpx, pydantic, ida_pro_mcp; "
+             "from mcp.server.mcpserver import MCPServer"],
             env=env, capture_output=True, timeout=30,
         )
         return result.returncode == 0
@@ -781,6 +783,7 @@ def main():
     global _explicit_target
     parser = argparse.ArgumentParser(description="IDA Pro MCP Server")
     parser.add_argument("--install", action="store_true", help="Install the MCP Server and IDA plugin")
+    parser.add_argument("--no-plugin", action="store_true", help="With --install, only configure MCP clients (skip the IDA plugin)")
     parser.add_argument("--uninstall", action="store_true", help="Uninstall the MCP Server and IDA plugin")
     parser.add_argument("--allow-ida-free", action="store_true", help="Allow installation despite IDA Free being installed")
     parser.add_argument("--generate-docs", action="store_true", help=argparse.SUPPRESS)
@@ -796,7 +799,8 @@ def main():
         return
 
     if args.install:
-        install_ida_plugin(allow_ida_free=args.allow_ida_free)
+        if not args.no_plugin:
+            install_ida_plugin(allow_ida_free=args.allow_ida_free)
         install_mcp_servers()
         return
 
@@ -835,12 +839,11 @@ def main():
             heartbeat=0.0,  # 0 => never pruned by heartbeat
         )
 
-    # Remove unsafe tools
+    # Remove unsafe tools (mcp 2.x public API)
     if not args.unsafe:
-        mcp_tools = mcp._tool_manager._tools
         for unsafe in UNSAFE_FUNCTIONS:
-            if unsafe in mcp_tools:
-                del mcp_tools[unsafe]
+            if mcp._tool_manager.get_tool(unsafe) is not None:
+                mcp.remove_tool(unsafe)
 
     try:
         if args.transport == "stdio":
@@ -849,12 +852,10 @@ def main():
             url = urlparse(args.transport)
             if url.hostname is None or url.port is None:
                 raise Exception(f"Invalid transport URL: {args.transport}")
-            mcp.settings.host = url.hostname
-            mcp.settings.port = url.port
-            # NOTE: npx @modelcontextprotocol/inspector for debugging
-            print(f"MCP Server availabile at http://{mcp.settings.host}:{mcp.settings.port}/sse")
             mcp.settings.log_level = "INFO"
-            mcp.run(transport="sse")
+            # NOTE: npx @modelcontextprotocol/inspector for debugging
+            print(f"MCP Server availabile at http://{url.hostname}:{url.port}/sse")
+            mcp.run(transport="sse", host=url.hostname, port=url.port)
     except KeyboardInterrupt:
         pass
 

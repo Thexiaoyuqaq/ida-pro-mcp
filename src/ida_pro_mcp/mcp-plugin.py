@@ -294,7 +294,7 @@ class MCPProtocolHandler:
         self.registry = registry
         self.server_info = {
             "name": "ida-pro-mcp",
-            "version": "1.6.0"
+            "version": "1.7.0"
         }
         self.capabilities = {
             "tools": {
@@ -363,7 +363,10 @@ class MCPProtocolHandler:
         return tools
 
     # Keep in sync with mcp.shared.version.SUPPORTED_PROTOCOL_VERSIONS
-    SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+    # 2025-11-25 is wire-compatible with the subset implemented here (initialize,
+    # tools/list, tools/call); 2026-07-28 is not implemented, so clients asking
+    # for it negotiate down to DEFAULT_PROTOCOL_VERSION.
+    SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
     DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 
     def handle_initialize(self, params: dict) -> dict:
@@ -3318,17 +3321,13 @@ def get_function_cfg(
                 instructions.append(f"{hex(current_ea)}: {insn}")
             current_ea = idaapi.next_head(current_ea, block.end_ea)
 
-        # Get successors
-        successors = []
-        for succ_idx in range(block.nsucc()):
-            succ_block = block.succ(succ_idx)
-            successors.append(hex(succ_block.start_ea))
+        # Get successors. IDA 9.x's ida_gdl.BasicBlock only exposes the
+        # succs()/preds() iterators; nsucc()/npred()/succ()/pred() belong to
+        # qflow_chart_t and are no longer forwarded on BasicBlock.
+        successors = [hex(succ_block.start_ea) for succ_block in block.succs()]
 
         # Get predecessors
-        predecessors = []
-        for pred_idx in range(block.npred()):
-            pred_block = block.pred(pred_idx)
-            predecessors.append(hex(pred_block.start_ea))
+        predecessors = [hex(pred_block.start_ea) for pred_block in block.preds()]
 
         # Track entry and exit blocks
         if block.start_ea == func.start_ea:
