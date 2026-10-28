@@ -211,7 +211,7 @@ uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 
 ## 5. 工具参考
 
-共 **80** 个工具：7 个 Gateway 工具 + 55 个安全 IDA 工具 + 18 个 `--unsafe` 调试器工具。
+共 **90** 个工具：7 个 Gateway 工具 + 65 个安全 IDA 工具 + 18 个 `--unsafe` 调试器工具。
 
 ### 5.1 连接与数据库（Gateway）
 
@@ -260,6 +260,7 @@ uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 |---|---|
 | `get_xrefs_to` | 指向某地址的所有引用 |
 | `get_xrefs_to_field` | 指向某结构体成员的所有引用 |
+| `who_references` | 一次返回直接 xref/callers + vtable/函数指针槽；虚函数/回调优先用 |
 
 ### 5.6 数据浏览
 
@@ -323,7 +324,7 @@ uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 | `get_global_variable_value_by_name` | 按名称读取全局变量值 |
 | `get_global_variable_value_at_address` | 按地址读取全局变量值 |
 | `search_bytes` | 带 `??` 通配符的字节搜索 |
-| `execute_script` | 执行任意 IDAPython（能力很大，谨慎使用） |
+| `execute_script` | 执行任意 IDAPython；`timeout_seconds` 会真正中断脚本（0 = 不限制） |
 
 ### 5.12 调试器（需要 `--unsafe`）
 
@@ -351,6 +352,93 @@ dbg_enable_breakpoint
 默认不会注册到 Gateway；启动时加 `--unsafe` 才可用。
 
 ---
+
+### 5.13 虚表 / 虚函数
+
+| 工具 | 说明 |
+|---|---|
+| `list_vtables` | 扫描数据段，找连续的“指向函数的指针”数组作为 vtable 候选 |
+| `find_vtable_refs` | 给定函数地址，找出它作为虚函数指针出现在哪个 vtable、第几槽、偏移多少 |
+| `analyze_vtable` | 读取某个 vtable 的 slots、目标函数、已绑定的 vftable 类型 |
+| `walk_type_registry` | 调试会话下遍历运行时类型/元类注册表（批量读取并缓存） |
+| `dump_metaclass_strings` | 扫描运行时 MetaSystem 对象，导出类/成员/方法名字符串 |
+| `dump_class_metadata_strings` | 从某个 MetaClass 实例出发，扫描其元数据区域的内联/静态字符串 |
+| `create_vftable_type` | 生成 vftable 结构体类型，`set_vftable_ea` 绑定地址并应用类型 |
+| `rename_vfuncs` | 把目标函数重命名为 `Class::vfunc_NN`，并添加 vtable → function 的 data xref |
+| `annotate_vtable` | 一键完成：建类型 + 绑定 + 重命名 + xref |
+
+典型流程：
+
+```text
+who_references("0x141985CD0")
+# → {direct_refs: [], callers: [], is_virtual: true,
+#    vtable_refs: [{pointer_slot: 0x141F72468, vtable_start: 0x141F723E0,
+#                   slot_index: 17, slot_offset: 0x88, installers: [...]}]}
+
+analyze_vtable("0x141F723E0")
+annotate_vtable("0x141F723E0", class_name="CMyClass")
+```
+
+说明：
+
+- 小函数如果 `get_xrefs_to` / `get_callers` 为空，先试 `who_references`；它会同时扫描 vtable/函数指针槽。
+- 扫描是启发式（连续函数指针），`min_slots` 可过滤误报；也可以先用 RTTI/构造函数定位。
+- 相邻 vtable 常紧挨着存放：工具会把“被代码引用的内部地址”（通常是下一个表的构造函数/注册点）当作边界自动切分。
+- `create_vftable_type` 用每个目标函数的原型生成函数指针成员。
+- 动态分派本身不会变成直接调用；要让 Hex-Rays 显示 `obj->vfunc()`，还需要把类指针类型应用到对象/`this`。
+
+运行时类型/元类注册表（需要 IDA 调试器；Sky.exe 示例）：
+
+```text
+# 0x1423D7AF0 是保存类型链表头的全局 qword
+walk_type_registry("0x1423D7AF0", "Meta")
+# → MetaClass / MetaSystem / 其他名字匹配的类型，含 node/vtable/instance/base
+
+walk_type_registry("0x1423D7AF0", "AccountCurrency")
+```
+
+按字符串查元类名/成员名（需要先拿到 `MetaSystem` 实例地址）：
+
+```text
+walk_type_registry("0x1423D7AF0", "MetaSystem", 1, 4000)
+# → instance = 0x9119EB0（每次启动会变）
+
+dump_metaclass_strings("0x9119EB0", substring="Transform")
+# → GetTransform / SetTransform
+
+dump_metaclass_strings("0x9119EB0", substring="Get")
+# → GetEnabled / GetIcon / GetNpc / GetObb / GetResumeEnabled / GetShopName / GetTransform ...
+```
+
+按类 dump（类成员/类型名常常是堆上的**内联字符串**，不是静态字符串指针）：
+
+```text
+walk_type_registry("0x1423D7AF0", "AccountBarn", 1, 4000)
+# → instance = 0x53D03C0
+
+dump_class_metadata_strings("0x53D03C0", substring="Color")
+# → Color
+
+dump_class_metadata_strings("0x53D03C0", window=2048)
+# → Color, SystemHeap, TgcString, float, int8_t, uint32_t, uint64_t, uint8_t ...
+```
+
+说明：
+
+- `dump_class_metadata_strings` 从 MetaClass 对象的 `+0x40/+0x48/+0x50/+0x58` 容器指针出发，按 `window` 字节向前扫描，同时提取内联 ASCII 字符串和指向静态字符串的指针。
+- 窗口会覆盖相邻元数据，可能混入附近的名字；用 `substring` 精确过滤。
+- 只解析可读区域；更大的结构可以加大 `window`（上限 0x4000）。
+
+- `dump_metaclass_strings` 扫描 MetaSystem 对象内部的指针字段，解析指向静态字符串的引用；这是全局类/方法名的来源。
+- 它不依赖 Lua 的 `__vars` / `__funs`（Sky 里通常是空的）；Lua 侧只有 `__ctype` / `__isclass` / `__metadata`（ClearMemory / ModuleGroup）。
+- 类成员/类型名常常是堆元数据里的内联字符串，用 `dump_class_metadata_strings`；更深层的容器/哈希表仍需要额外解析。
+
+- 缓存按 `registry_global` 保存；首次调用读取并缓存，后续查询只过滤缓存。
+- 传 `refresh=True` 可在目标重载/类型动态增加后重建。
+- 节点布局是 Sky 引擎的观察结果（+0x00 vtable、+0x08 name、+0x18 base、+0x28 instance），其他引擎需要调整。
+- 元类内部的 `(name, value)` 元数据列表不在类型节点里，而由游戏的 `PrintMetaClassMem` / `DumpMetaSystem` 命令上下文持有；需要在 `sub_141359F60` 命中时读 `RCX` 后按 `[RCX+0xB8] → +8 → +0x108` 遍历。
+
+
 
 ## 6. 开发
 
@@ -525,6 +613,7 @@ mrexodia/ida-pro-mcp  →  icryo/ida-pro-mcp (v1.6.0 功能线)  →  本项目 
 - 迁移到 `mcp` 2.x `MCPServer`
 - 修复 IDA 9.5 `BasicBlock` API 兼容
 - 多数据库 Gateway（实例注册表、并发转发、headless 进程池）
+- vtable / 虚函数工具（扫描、建 vftable 类型、重命名、xref）
 - MCP 协议版本支持到 `2025-11-25`
 - 重写文档与安装/排障说明
 

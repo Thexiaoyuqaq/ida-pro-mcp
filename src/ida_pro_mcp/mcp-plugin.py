@@ -2085,7 +2085,11 @@ class Xref(TypedDict):
 def get_xrefs_to(
     address: Annotated[str, "Address to get cross references to"],
 ) -> list[Xref]:
-    """Get all cross references to the given address"""
+    """Get all cross references to the given address
+
+    For virtual methods, callbacks, or dispatch-table entries, direct xrefs can
+    be empty. In that case also try `who_references` or `find_vtable_refs`.
+    """
     xrefs = []
     xref: ida_xref.xrefblk_t
     for xref in idautils.XrefsTo(parse_address(address)): # type: ignore (IDA SDK type hints are incorrect)
@@ -2180,7 +2184,11 @@ def get_callees(
 def get_callers(
     function_address: Annotated[str, "Address of the function to get callers"],
 ) -> list[Function]:
-    """Get all callers of the given address"""
+    """Get all callers of the given address
+
+    For virtual methods or callbacks this can be empty; use `who_references` or
+    `find_vtable_refs` to resolve function-pointer/vtable references.
+    """
     callers = {}
     for caller_address in idautils.CodeRefsTo(parse_address(function_address), 0):
         # validate the xref address is a function
@@ -3355,6 +3363,849 @@ def get_function_cfg(
     )
 
 # =============================================================================
+# Vtables / virtual functions
+# =============================================================================
+
+class VtableSlot(TypedDict):
+    index: int
+    slot_address: str
+    target_address: str
+    target_name: str
+    is_function: bool
+
+
+class VtableCandidate(TypedDict):
+    address: str
+    slot_count: int
+    segment: str
+    first_target: str
+    first_target_name: str
+
+
+class VtableInfo(TypedDict):
+    address: str
+    slot_count: int
+    type_ordinal: int
+    type_name: Optional[str]
+    is_vftable: bool
+    slots: list[VtableSlot]
+
+
+class VtableTypeResult(TypedDict):
+    address: str
+    type_name: str
+    ordinal: int
+    slot_count: int
+    bound: bool
+    applied: bool
+    slots: list[VtableSlot]
+
+
+class RenameVfuncResult(TypedDict):
+    index: int
+    slot_address: str
+    target_address: str
+    old_name: str
+    new_name: str
+    renamed: bool
+
+
+class VtableAnnotation(TypedDict):
+    type: VtableTypeResult
+    renames: list[RenameVfuncResult]
+
+
+class VtableRef(TypedDict):
+    function_address: str
+    function_name: str
+    pointer_slot: str
+    vtable_start: str
+    slot_index: int
+    slot_offset: str
+    installers: list[str]
+
+
+class DirectRef(TypedDict):
+    from_address: str
+    type: str
+    is_code: bool
+    function: Optional[str]
+
+
+class ReferenceSummary(TypedDict):
+    address: str
+    name: str
+    direct_refs: list[DirectRef]
+    callers: list[str]
+    vtable_refs: list[VtableRef]
+    is_virtual: bool
+
+
+class RegistryType(TypedDict):
+    node: str
+    name: str
+    vtable: str
+    instance: str
+    base: Optional[str]
+    base_name: Optional[str]
+
+
+class RegistryWalk(TypedDict):
+    head: str
+    total_nodes: int
+    matches: list[RegistryType]
+
+
+class MetaclassString(TypedDict):
+    string: str
+    refs: int
+
+
+class MetaclassStringDump(TypedDict):
+    object: str
+    size: int
+    count: int
+    strings: list[MetaclassString]
+
+
+class ClassMetadataStrings(TypedDict):
+    class_name: str
+    instance: str
+    count: int
+    strings: list[MetaclassString]
+
+
+def _ptr_size() -> int:
+    return 8 if ida_ida.inf_is_64bit() else 4
+
+
+def _read_ptr(ea: int) -> int:
+    return ida_bytes.get_qword(ea) if _ptr_size() == 8 else ida_bytes.get_dword(ea)
+
+
+def _is_exec_ea(ea: int) -> bool:
+    seg = ida_segment.getseg(ea)
+    return bool(seg and (seg.perm & ida_segment.SEGPERM_EXEC))
+
+
+def _has_code_ref(ea: int) -> bool:
+    """True if some instruction (an address in an executable segment) references ea.
+
+    Note: an `lea` reference is a *data* xref (dr_O), so `_xref.iscode` is
+    False even though the referencing address is code. Check the segment of
+    the referencing address instead.
+    """
+    for x in idautils.XrefsTo(ea):
+        if _is_exec_ea(x.frm):
+            return True
+    return False
+
+
+def _func_name_or_hex(ea: int) -> str:
+    return ida_funcs.get_func_name(ea) or hex(ea)
+
+
+def _is_fn_ptr(ea: int) -> bool:
+    value = _read_ptr(ea)
+    return value not in (0, idaapi.BADADDR) and _is_exec_ea(value) and ida_funcs.get_func(value) is not None
+
+
+def _iter_ptr_hits(value: int):
+    """Yield data addresses that contain `value` as a pointer-sized integer."""
+    ptr_size = _ptr_size()
+    needle = struct.pack("<Q" if ptr_size == 8 else "<I", value)
+    for i in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(i)
+        if not seg:
+            continue
+        if seg.perm & ida_segment.SEGPERM_EXEC:
+            continue
+        if not (seg.perm & ida_segment.SEGPERM_READ):
+            continue
+        if seg.type == ida_segment.SEG_BSS:
+            continue
+        data = ida_bytes.get_bytes(seg.start_ea, seg.end_ea - seg.start_ea)
+        if not data:
+            continue
+        pos = 0
+        while True:
+            idx = data.find(needle, pos)
+            if idx < 0:
+                break
+            yield seg.start_ea + idx
+            pos = idx + 1
+
+
+def _find_vtable_start(slot_ea: int, seg, max_walk: int = 512) -> int:
+    """Walk backwards to the nearest vtable start (interior code ref or run start)."""
+    ptr_size = _ptr_size()
+    start = slot_ea
+    steps = 0
+    while start - ptr_size >= seg.start_ea and steps < max_walk:
+        prev = start - ptr_size
+        if not _is_fn_ptr(prev):
+            break
+        start = prev
+        steps += 1
+        if _has_code_ref(start):
+            break
+    return start
+
+
+def _code_refs_to(ea: int) -> list[str]:
+    return [hex(x.frm) for x in idautils.XrefsTo(ea) if _is_exec_ea(x.frm)]
+
+
+def _vtable_slots(vt_ea: int, max_slots: int) -> list[tuple[int, int, Optional[ida_funcs.func_t]]]:
+    """Read consecutive function-pointer slots starting at vt_ea."""
+    ptr_size = _ptr_size()
+    cap = max_slots if max_slots > 0 else 512
+    slots: list[tuple[int, int, Optional[ida_funcs.func_t]]] = []
+    for i in range(cap):
+        slot_ea = vt_ea + i * ptr_size
+        # Adjacent vtables are packed back-to-back. A code reference to an
+        # interior slot (e.g. the next class's registration `lea`) marks the
+        # start of the next table, so stop before including it.
+        if i > 0 and _has_code_ref(slot_ea):
+            break
+        if not ida_bytes.is_loaded(slot_ea):
+            break
+        target = _read_ptr(slot_ea)
+        if target in (0, idaapi.BADADDR) or not _is_exec_ea(target):
+            break
+        slots.append((slot_ea, target, ida_funcs.get_func(target)))
+    return slots
+
+
+def _vfunc_ptr_type(target_ea: int) -> ida_typeinf.tinfo_t:
+    func = ida_funcs.get_func(target_ea)
+    if func is not None:
+        try:
+            proto = func.get_prototype()
+            if proto is not None and not proto.empty():
+                ptr = ida_typeinf.tinfo_t()
+                if ptr.create_ptr(proto):
+                    return ptr
+        except Exception:
+            pass
+    for decl in ("void (__fastcall *)(void)", "void (*)(void)"):
+        try:
+            tif = ida_typeinf.tinfo_t(decl)
+            if tif is not None and not tif.empty():
+                return tif
+        except Exception:
+            pass
+    raise IDAError("Failed to build a function pointer type for vfunc slot")
+
+
+def _sanitize_class_name(name: str) -> str:
+    name = (name or "").strip()
+    return "".join(ch if (ch.isalnum() or ch in "_:$?@") else "_" for ch in name)
+
+
+def _vtable_type_info(vt_ea: int) -> tuple[int, Optional[str], bool]:
+    ordinal = ida_typeinf.get_vftable_ordinal(vt_ea)
+    if not ordinal:
+        return 0, None, False
+    tif = ida_typeinf.tinfo_t()
+    if tif.get_numbered_type(ida_typeinf.get_idati(), ordinal):
+        return ordinal, tif.get_type_name(), tif.is_vftable()
+    return ordinal, None, False
+
+
+def _collect_vtable_candidates(min_slots: int, max_results: int, segment_filter: str):
+    """Scan readable data segments for runs of pointers to functions."""
+    ptr_size = _ptr_size()
+    fmt = "<Q" if ptr_size == 8 else "<I"
+    min_slots = max(1, min_slots)
+    needle = (segment_filter or "").lower()
+    found: list[tuple[int, int, str]] = []
+    chunk_size = 0x10000
+
+    def add_run(run_start: Optional[int], run_len: int, seg_name: str) -> bool:
+        """Append a run, splitting it at interior code-referenced addresses."""
+        if run_start is None or run_len < min_slots:
+            return False
+        boundaries = [run_start]
+        if run_len <= 4096:
+            for k in range(1, run_len):
+                ea = run_start + k * ptr_size
+                if _has_code_ref(ea):
+                    boundaries.append(ea)
+        boundaries.append(run_start + run_len * ptr_size)
+        for b0, b1 in zip(boundaries, boundaries[1:]):
+            n = (b1 - b0) // ptr_size
+            if n < min_slots:
+                continue
+            found.append((b0, n, seg_name))
+            if max_results > 0 and len(found) >= max_results:
+                return True
+        return False
+
+    for i in range(ida_segment.get_segm_qty()):
+        seg = ida_segment.getnseg(i)
+        if not seg:
+            continue
+        if seg.perm & ida_segment.SEGPERM_EXEC:
+            continue
+        if not (seg.perm & ida_segment.SEGPERM_READ):
+            continue
+        if seg.type == ida_segment.SEG_BSS:
+            continue
+        seg_name = ida_segment.get_segm_name(seg) or ""
+        if needle and needle not in seg_name.lower():
+            continue
+
+        run_start: Optional[int] = None
+        run_len = 0
+        ea = (seg.start_ea + ptr_size - 1) & ~(ptr_size - 1)
+        while ea + ptr_size <= seg.end_ea:
+            size = min(chunk_size, seg.end_ea - ea)
+            data = ida_bytes.get_bytes(ea, size)
+            if not data:
+                if add_run(run_start, run_len, seg_name):
+                    return found
+                run_start, run_len = None, 0
+                ea += chunk_size
+                continue
+
+            count = len(data) // ptr_size
+            for j in range(count):
+                target = struct.unpack_from(fmt, data, j * ptr_size)[0]
+                cur = ea + j * ptr_size
+                if _is_exec_ea(target) and ida_funcs.get_func(target) is not None:
+                    if run_start is None:
+                        run_start = cur
+                    run_len += 1
+                else:
+                    if add_run(run_start, run_len, seg_name):
+                        return found
+                    run_start, run_len = None, 0
+            ea += size
+
+        if add_run(run_start, run_len, seg_name):
+            return found
+    return found
+
+
+def _make_slots(vt_ea: int, max_slots: int) -> list[VtableSlot]:
+    return [
+        VtableSlot(
+            index=i,
+            slot_address=hex(slot_ea),
+            target_address=hex(target),
+            target_name=_func_name_or_hex(target),
+            is_function=func is not None,
+        )
+        for i, (slot_ea, target, func) in enumerate(_vtable_slots(vt_ea, max_slots))
+    ]
+
+
+def _create_vftable_type_impl(vt_ea: int, type_name: str, max_slots: int) -> VtableTypeResult:
+    slots = _vtable_slots(vt_ea, max_slots)
+    if not slots:
+        raise IDAError(f"No vtable slots found at {hex(vt_ea)}")
+
+    if not type_name:
+        type_name = f"vftable_{vt_ea:X}"
+    type_name = _sanitize_class_name(type_name)
+    if not type_name:
+        type_name = f"vftable_{vt_ea:X}"
+
+    ptr_size = _ptr_size()
+    udt = ida_typeinf.udt_type_data_t()
+    udt.set_vftable(True)
+    for i, (_slot_ea, target, _func) in enumerate(slots):
+        udt.add_member(f"vfunc_{i:02d}", _vfunc_ptr_type(target), i * ptr_size * 8)
+
+    tif = ida_typeinf.tinfo_t()
+    if not tif.create_udt(udt):
+        raise IDAError("Failed to create vftable struct type")
+    code = tif.set_named_type(None, type_name, ida_typeinf.NTF_REPLACE)
+    if code != ida_typeinf.TERR_OK:
+        raise IDAError(f"Failed to save vftable type '{type_name}' (error {code})")
+    ordinal = tif.get_ordinal()
+    if not ordinal:
+        raise IDAError("Failed to save vftable type into the local type library")
+
+    bound = bool(ida_typeinf.set_vftable_ea(ordinal, vt_ea))
+    applied = bool(ida_typeinf.apply_tinfo(vt_ea, tif, ida_typeinf.PT_SIL))
+    return VtableTypeResult(
+        address=hex(vt_ea),
+        type_name=type_name,
+        ordinal=ordinal,
+        slot_count=len(slots),
+        bound=bound,
+        applied=applied,
+        slots=_make_slots(vt_ea, max_slots),
+    )
+
+
+def _rename_vfuncs_impl(vt_ea: int, class_name: str, max_slots: int, force: bool) -> list[RenameVfuncResult]:
+    slots = _vtable_slots(vt_ea, max_slots)
+    class_name = _sanitize_class_name(class_name) or f"vftable_{vt_ea:X}"
+    results: list[RenameVfuncResult] = []
+    default_prefixes = ("sub_", "nullsub_", "unknown_", "j_sub_", "thunk_")
+    seen_targets: set[int] = set()
+
+    for i, (slot_ea, target, func) in enumerate(slots):
+        old_name = _func_name_or_hex(target)
+        wanted = f"{class_name}::vfunc_{i:02d}"
+        renamed = False
+        new_name = old_name
+        if (func is not None and target not in seen_targets
+                and old_name != wanted and (force or old_name.startswith(default_prefixes))):
+            if ida_name.set_name(target, wanted, ida_name.SN_NOWARN | ida_name.SN_NON_AUTO):
+                new_name = wanted
+                renamed = True
+        seen_targets.add(target)
+        try:
+            ida_xref.add_dref(slot_ea, target, ida_xref.dr_R | ida_xref.XREF_USER)
+        except Exception:
+            pass
+        results.append(RenameVfuncResult(
+            index=i,
+            slot_address=hex(slot_ea),
+            target_address=hex(target),
+            old_name=old_name,
+            new_name=new_name,
+            renamed=renamed,
+        ))
+    return results
+
+
+@jsonrpc
+@idaread
+def list_vtables(
+    min_slots: Annotated[int, "Minimum number of consecutive function-pointer slots"] = 2,
+    max_results: Annotated[int, "Maximum number of candidates to return (0 = all)"] = 100,
+    segment_filter: Annotated[str, "Only scan segments whose name contains this (case-insensitive); empty = all data segments"] = "",
+) -> list[VtableCandidate]:
+    """Scan data segments for candidate C++ vtables (runs of pointers to functions)."""
+    candidates = _collect_vtable_candidates(min_slots, max_results, segment_filter)
+    result: list[VtableCandidate] = []
+    for vt_ea, slot_count, seg_name in candidates:
+        target = _read_ptr(vt_ea)
+        result.append(VtableCandidate(
+            address=hex(vt_ea),
+            slot_count=slot_count,
+            segment=seg_name,
+            first_target=hex(target),
+            first_target_name=_func_name_or_hex(target),
+        ))
+    return result
+
+
+def _find_vtable_refs_impl(func_ea: int, max_results: int) -> list[VtableRef]:
+    ptr_size = _ptr_size()
+    results: list[VtableRef] = []
+    max_hits = 1024
+
+    for hit_no, hit in enumerate(_iter_ptr_hits(func_ea)):
+        if hit_no >= max_hits:
+            break
+        seg = ida_segment.getseg(hit)
+        if seg is None or not _is_fn_ptr(hit):
+            continue
+        start = _find_vtable_start(hit, seg)
+        index = (hit - start) // ptr_size
+        if index < 0 or index > 512:
+            continue
+        results.append(VtableRef(
+            function_address=hex(func_ea),
+            function_name=_func_name_or_hex(func_ea),
+            pointer_slot=hex(hit),
+            vtable_start=hex(start),
+            slot_index=index,
+            slot_offset=hex(index * ptr_size),
+            installers=_code_refs_to(start),
+        ))
+        if max_results > 0 and len(results) >= max_results:
+            break
+    return results
+
+
+@jsonrpc
+@idaread
+def find_vtable_refs(
+    function_address: Annotated[str, "Address of the function to look up. Use this when get_xrefs_to/get_callers is empty for a small function (virtual method or callback)."],
+    max_results: Annotated[int, "Maximum number of pointer slots to report (0 = all)"] = 50,
+) -> list[VtableRef]:
+    """Find vtables/slots that store this function as a virtual-method pointer."""
+    return _find_vtable_refs_impl(parse_address(function_address), max_results)
+
+
+@jsonrpc
+@idaread
+def who_references(
+    address: Annotated[str, "Function address to look up"],
+    max_vtable_results: Annotated[int, "Maximum vtable pointer slots to report (0 = all)"] = 50,
+) -> ReferenceSummary:
+    """One-stop reference lookup: direct xrefs/callers plus vtable/function-pointer slots.
+
+    Prefer this over get_xrefs_to when the target looks like a virtual method,
+    callback, or dispatch-table entry and you need to know who references it.
+    """
+    ea = parse_address(address)
+    direct: list[DirectRef] = []
+    callers: list[str] = []
+    for x in idautils.XrefsTo(ea):
+        func = ida_funcs.get_func(x.frm)
+        fname = _func_name_or_hex(func.start_ea) if func is not None else None
+        direct.append(DirectRef(
+            from_address=hex(x.frm),
+            type=str(int(x.type)),
+            is_code=bool(x.iscode),
+            function=fname,
+        ))
+        if x.iscode and fname and fname not in callers:
+            callers.append(fname)
+
+    vtable_refs = _find_vtable_refs_impl(ea, max_vtable_results)
+    return ReferenceSummary(
+        address=hex(ea),
+        name=_func_name_or_hex(ea),
+        direct_refs=direct,
+        callers=callers,
+        vtable_refs=vtable_refs,
+        is_virtual=bool(vtable_refs),
+    )
+
+
+_TYPE_REGISTRY_CACHE: dict[str, tuple[list[RegistryType], bool]] = {}
+
+
+def _dbg_read(ea: int, size: int) -> Optional[bytes]:
+    try:
+        data = idc.get_bytes(ea, size, True)
+        return bytes(data) if isinstance(data, (bytes, bytearray)) else None
+    except Exception:
+        return None
+
+
+def _dbg_qword(ea: int) -> int:
+    data = _dbg_read(ea, 8)
+    if data is not None and len(data) == 8:
+        return struct.unpack("<Q", data)[0]
+    try:
+        v = idc.read_dbg_qword(ea)
+        return v if isinstance(v, int) else 0
+    except Exception:
+        return 0
+
+
+def _dbg_cstr(ea: int, max_len: int = 160) -> Optional[str]:
+    if not ea:
+        return None
+    data = _dbg_read(ea, max_len)
+    if not data:
+        return None
+    end = data.find(b"\x00")
+    if end >= 0:
+        data = data[:end]
+    if not data:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def _read_type_node(node: int) -> Optional[tuple[int, Optional[str], int, int]]:
+    """Return (vtable, name, base, instance) for one runtime type node."""
+    data = _dbg_read(node, 0x30)
+    if data is None or len(data) < 0x30:
+        return None
+    vtable = struct.unpack_from("<Q", data, 0)[0]
+    name_ptr = struct.unpack_from("<Q", data, 8)[0]
+    base = struct.unpack_from("<Q", data, 0x18)[0]
+    instance = struct.unpack_from("<Q", data, 0x28)[0]
+    return vtable, _dbg_cstr(name_ptr), base, instance
+
+
+@jsonrpc
+@idaread
+def walk_type_registry(
+    registry_global: Annotated[str, "Address of the global qword holding the runtime type-list head (Sky.exe: 0x1423D7AF0)"],
+    name_filter: Annotated[str, "Case-insensitive substring filter on type names"] = "",
+    max_results: Annotated[int, "Maximum matches to return (0 = all)"] = 50,
+    max_nodes: Annotated[int, "Maximum nodes to traverse (default 4000)"] = 4000,
+    refresh: Annotated[bool, "Rebuild the cached registry instead of reusing it"] = False,
+) -> RegistryWalk:
+    """Walk the runtime type/metaclass registry (requires an IDA debugging session).
+
+    The registry is read once with bulk debugger reads and cached; later calls
+    only filter the cache. Node layout observed in the Sky engine:
+    +0x00 vtable, +0x08 name, +0x18 previous/base node, +0x28 type instance.
+    """
+    key = registry_global
+    entries = None
+    if not refresh:
+        cached = _TYPE_REGISTRY_CACHE.get(key)
+        if cached is not None:
+            cached_entries, complete = cached
+            # Reuse a complete walk, or a partial walk that already covers
+            # everything the caller asked for.
+            if complete or (max_nodes > 0 and len(cached_entries) >= max_nodes):
+                entries = cached_entries
+
+    if entries is None:
+        try:
+            debugger_on = ida_dbg.is_debugger_on()
+        except Exception:
+            debugger_on = False
+        if not debugger_on:
+            raise IDAError("Debugger is not running. Attach to or start the target process first.")
+
+        head = _dbg_qword(parse_address(registry_global))
+        if not head:
+            raise IDAError(f"No runtime type-list head at {registry_global} (is the target initialized?)")
+
+        entries = []
+        name_by_node: dict[str, str] = {}
+        seen: set[int] = set()
+        limit = max_nodes if max_nodes > 0 else 20000
+        node = head
+        while node and node not in seen and len(entries) < limit:
+            seen.add(node)
+            rec = _read_type_node(node)
+            if rec is None:
+                break
+            vtable, name, base, instance = rec
+            entry = RegistryType(
+                node=hex(node),
+                name=name or "",
+                vtable=hex(vtable),
+                instance=hex(instance),
+                base=hex(base) if base else None,
+                base_name=None,
+            )
+            entries.append(entry)
+            name_by_node[entry["node"]] = entry["name"]
+            node = base
+
+        for entry in entries:
+            if entry["base"]:
+                entry["base_name"] = name_by_node.get(entry["base"])
+
+        complete = bool(node == 0)
+        _TYPE_REGISTRY_CACHE.clear()
+        _TYPE_REGISTRY_CACHE[key] = (entries, complete)
+
+    needle = (name_filter or "").lower()
+    matches = [e for e in entries if not needle or needle in e["name"].lower()]
+    if max_results > 0:
+        matches = matches[:max_results]
+    head_hex = entries[0]["node"] if entries else "0x0"
+    return RegistryWalk(head=head_hex, total_nodes=len(entries), matches=matches)
+
+
+@jsonrpc
+@idaread
+def dump_metaclass_strings(
+    metasystem_instance: Annotated[str, "Runtime MetaSystem instance address (instance field from walk_type_registry('MetaSystem'))"],
+    size: Annotated[int, "Bytes of the MetaSystem object to scan (default 24592 = MetaSystem.__sizeof)"] = 24592,
+    substring: Annotated[str, "Optional case-insensitive substring filter"] = "",
+    max_results: Annotated[int, "Maximum strings to return (0 = all)"] = 500,
+) -> MetaclassStringDump:
+    """Dump identifier-like strings referenced by the runtime MetaSystem object.
+
+    Class/member/method names are not stored as Lua table keys; they live as
+    string pointers inside the C++ MetaSystem object. This scans the object's
+    pointer-sized fields and resolves pointers to static strings. Requires an
+    active IDA debugging session.
+    """
+    try:
+        debugger_on = ida_dbg.is_debugger_on()
+    except Exception:
+        debugger_on = False
+    if not debugger_on:
+        raise IDAError("Debugger is not running. Attach to or start the target process first.")
+
+    ea = parse_address(metasystem_instance)
+    scan_size = max(16, min(size, 0x100000))
+    data = idc.get_bytes(ea, scan_size, True)
+    if not data:
+        raise IDAError(f"Failed to read {scan_size} bytes at {metasystem_instance}")
+
+    ptr_size = _ptr_size()
+    fmt = "<Q" if ptr_size == 8 else "<I"
+    counts: dict[str, int] = {}
+    for off in range(0, len(data) - ptr_size + 1, ptr_size):
+        value = struct.unpack_from(fmt, data, off)[0]
+        seg = ida_segment.getseg(value)
+        if seg is None or not (seg.perm & ida_segment.SEGPERM_READ):
+            continue
+        raw = idc.get_strlit_contents(value)
+        if not raw:
+            continue
+        try:
+            text = raw.decode("ascii")
+        except Exception:
+            continue
+        if not (3 <= len(text) <= 96):
+            continue
+        if not all(32 <= ord(ch) < 127 for ch in text):
+            continue
+        if not (text[0].isalpha() or text[0] == "_"):
+            continue
+        if not any(ch.islower() for ch in text):
+            continue
+        if not all(ch.isalnum() or ch in "_:.@$?-" for ch in text):
+            continue
+        counts[text] = counts.get(text, 0) + 1
+
+    needle = (substring or "").lower()
+    items = [
+        MetaclassString(string=text, refs=refs)
+        for text, refs in counts.items()
+        if not needle or needle in text.lower()
+    ]
+    items.sort(key=lambda item: (-item["refs"], item["string"]))
+    if max_results > 0:
+        items = items[:max_results]
+    return MetaclassStringDump(object=hex(ea), size=len(data), count=len(items), strings=items)
+
+
+@jsonrpc
+@idaread
+def dump_class_metadata_strings(
+    class_instance: Annotated[str, "Runtime MetaClass instance address (instance field from walk_type_registry)"],
+    window: Annotated[int, "Bytes to scan forward from each metadata pointer (default 2048)"] = 2048,
+    substring: Annotated[str, "Optional case-insensitive substring filter"] = "",
+    max_results: Annotated[int, "Maximum strings to return (0 = all)"] = 200,
+) -> ClassMetadataStrings:
+    """Dump inline/static strings from a class's metadata region (debugger required).
+
+    Class member/type names are often stored as inline strings in heap metadata
+    arrays rather than as pointers to static strings. This reads the MetaClass
+    object and scans the regions reachable from its container fields.
+    """
+    try:
+        debugger_on = ida_dbg.is_debugger_on()
+    except Exception:
+        debugger_on = False
+    if not debugger_on:
+        raise IDAError("Debugger is not running. Attach to or start the target process first.")
+
+    ea = parse_address(class_instance)
+    head = idc.get_bytes(ea, 0x68, True)
+    if not head:
+        raise IDAError(f"Failed to read MetaClass object at {class_instance}")
+
+    class_name = _dbg_cstr(_dbg_qword(ea + 8)) or ""
+    window = max(0x20, min(window, 0x4000))
+    regions: dict[int, int] = {ea: 0x68}
+    for off in (0x40, 0x48, 0x50, 0x58):
+        ptr = _dbg_qword(ea + off)
+        if 0x10000 < ptr < 0x7FFFFFFFFFFF:
+            regions[ptr] = max(regions.get(ptr, 0), window)
+
+    counts: dict[str, int] = {}
+
+    def add(text: str):
+        if not (3 <= len(text) <= 96):
+            return
+        if not (text[0].isalpha() or text[0] == "_"):
+            return
+        if not any(ch.islower() for ch in text):
+            return
+        if not all(ch.isalnum() or ch in "_:.@$?-" for ch in text):
+            return
+        counts[text] = counts.get(text, 0) + 1
+
+    ptr_size = _ptr_size()
+    fmt = "<Q" if ptr_size == 8 else "<I"
+    for addr, size in regions.items():
+        data = idc.get_bytes(addr, size, True)
+        if not data:
+            continue
+        for match in re.finditer(rb"[A-Za-z_][A-Za-z0-9_:@$?]{2,95}", data):
+            try:
+                add(match.group(0).decode("ascii"))
+            except Exception:
+                pass
+        for off in range(0, len(data) - ptr_size + 1, ptr_size):
+            value = struct.unpack_from(fmt, data, off)[0]
+            seg = ida_segment.getseg(value)
+            if seg is None or not (seg.perm & ida_segment.SEGPERM_READ):
+                continue
+            raw = idc.get_strlit_contents(value)
+            if raw:
+                try:
+                    add(raw.decode("ascii"))
+                except Exception:
+                    pass
+
+    needle = (substring or "").lower()
+    items = [
+        MetaclassString(string=text, refs=refs)
+        for text, refs in counts.items()
+        if not needle or needle in text.lower()
+    ]
+    items.sort(key=lambda item: (-item["refs"], item["string"]))
+    if max_results > 0:
+        items = items[:max_results]
+    return ClassMetadataStrings(
+        class_name=class_name, instance=hex(ea), count=len(items), strings=items,
+    )
+
+
+@jsonrpc
+@idaread
+def analyze_vtable(    address: Annotated[str, "Address of the vtable"],
+    max_slots: Annotated[int, "Maximum number of slots to read (default 256)"] = 256,
+) -> VtableInfo:
+    """Inspect a vtable: slots, target functions, and the currently bound vftable type."""
+    vt_ea = parse_address(address)
+    slots = _make_slots(vt_ea, max_slots)
+    ordinal, type_name, is_vftable = _vtable_type_info(vt_ea)
+    return VtableInfo(
+        address=hex(vt_ea),
+        slot_count=len(slots),
+        type_ordinal=ordinal,
+        type_name=type_name,
+        is_vftable=is_vftable,
+        slots=slots,
+    )
+
+
+@jsonrpc
+@idawrite
+def create_vftable_type(
+    address: Annotated[str, "Address of the vtable"],
+    type_name: Annotated[str, "Name for the generated vftable struct (empty = auto-generated)"] = "",
+    max_slots: Annotated[int, "Maximum number of slots (0 = all detected, capped at 512)"] = 0,
+) -> VtableTypeResult:
+    """Create a vftable struct type, bind it to the vtable address, and apply it."""
+    return _create_vftable_type_impl(parse_address(address), type_name, max_slots)
+
+
+@jsonrpc
+@idawrite
+def rename_vfuncs(
+    address: Annotated[str, "Address of the vtable"],
+    class_name: Annotated[str, "Class name prefix (e.g. MyClass)"],
+    max_slots: Annotated[int, "Maximum number of slots (0 = all detected, capped at 512)"] = 0,
+    force: Annotated[bool, "Also rename targets that already have non-default names"] = False,
+) -> list[RenameVfuncResult]:
+    """Rename vtable target functions to Class::vfunc_NN and add vtable -> function xrefs."""
+    return _rename_vfuncs_impl(parse_address(address), class_name, max_slots, force)
+
+
+@jsonrpc
+@idawrite
+def annotate_vtable(
+    address: Annotated[str, "Address of the vtable"],
+    class_name: Annotated[str, "Class name (empty = use the generated type name)"] = "",
+    max_slots: Annotated[int, "Maximum number of slots (0 = all detected, capped at 512)"] = 0,
+    force: Annotated[bool, "Also rename targets that already have non-default names"] = False,
+) -> VtableAnnotation:
+    """One-shot: create/bind the vftable type, rename targets, and add xrefs."""
+    vt_ea = parse_address(address)
+    type_result = _create_vftable_type_impl(vt_ea, class_name, max_slots)
+    renames = _rename_vfuncs_impl(vt_ea, class_name or type_result["type_name"], max_slots, force)
+    return VtableAnnotation(type=type_result, renames=renames)
+
+
+# =============================================================================
 # Script Execution
 # =============================================================================
 
@@ -3433,8 +4284,21 @@ def execute_script(
 
     try:
         with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-            # Execute the code
-            exec(code, exec_globals)
+            timeout = max(0, int(timeout_seconds))
+            old_trace = sys.gettrace()
+            if timeout > 0:
+                deadline = time.monotonic() + timeout
+
+                def _timeout_trace(frame, event, arg):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"execute_script exceeded {timeout} seconds")
+                    return _timeout_trace
+
+                sys.settrace(_timeout_trace)
+            try:
+                exec(code, exec_globals)
+            finally:
+                sys.settrace(old_trace)
 
         # Get the result if user set it
         if 'result' in exec_globals and exec_globals['result'] is not None:

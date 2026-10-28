@@ -24,7 +24,16 @@ import ida_hexrays
 
 logger = logging.getLogger(__name__)
 
-mcp = MCPServer("ida-pro-mcp", version="1.7.0")
+mcp = MCPServer(
+    "ida-pro-mcp",
+    version="1.7.0",
+    instructions=(
+        "IDA Pro analysis server. When get_xrefs_to()/get_callers() returns empty "
+        "for a function, it may be a virtual method, callback, or dispatch-table "
+        "entry: call who_references() (or find_vtable_refs()) to resolve vtable "
+        "and function-pointer slots."
+    ),
+)
 
 # Global state for database management
 _db_state = {

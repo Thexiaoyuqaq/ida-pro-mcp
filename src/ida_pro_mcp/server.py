@@ -24,7 +24,17 @@ from mcp.server.mcpserver import MCPServer
 from ida_pro_mcp import discovery
 
 # Keep log_level=ERROR so stdout stays clean for stdio clients (Cline et al.).
-mcp = MCPServer("ida-pro-mcp", version="1.7.0", log_level="ERROR")
+mcp = MCPServer(
+    "ida-pro-mcp",
+    version="1.7.0",
+    log_level="ERROR",
+    instructions=(
+        "IDA Pro analysis server. When get_xrefs_to()/get_callers() returns empty "
+        "for a function, it may be a virtual method, callback, or dispatch-table "
+        "entry: call who_references() (or find_vtable_refs()) to resolve vtable "
+        "and function-pointer slots."
+    ),
+)
 
 # Gateway-native tools (not generated from mcp-plugin.py). Kept safe/auto-approved.
 GATEWAY_TOOLS = [
